@@ -1,0 +1,659 @@
+name: PC criado pelo @alves7.pcm
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: 'Instance Number (1-10)'
+        required: true
+        default: '1'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  deploy-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+
+    # ============================================================
+    # CHECKOUT
+    # ============================================================
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    # ============================================================
+    # PREPARAR WINDOWS
+    # ============================================================
+    - name: Prepare Windows Like a New PC
+      shell: powershell
+      run: |
+        Write-Host "========================================" -ForegroundColor Cyan
+        Write-Host "PREPARING WINDOWS" -ForegroundColor Green
+        Write-Host "========================================" -ForegroundColor Cyan
+
+        $services = @(
+          "Audiosrv",
+          "AudioEndpointBuilder",
+          "Dhcp",
+          "Dnscache",
+          "NlaSvc",
+          "netprofm"
+        )
+
+        foreach ($service in $services) {
+          try {
+            Set-Service `
+              -Name $service `
+              -StartupType Automatic `
+              -ErrorAction SilentlyContinue
+
+            Start-Service `
+              -Name $service `
+              -ErrorAction SilentlyContinue
+
+            Write-Host "$service configured." -ForegroundColor Green
+          }
+          catch {
+            Write-Host "Could not configure $service." -ForegroundColor Yellow
+          }
+        }
+
+        Set-ItemProperty `
+          -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+          -Name "fDenyTSConnections" `
+          -Value 0
+
+        Set-ItemProperty `
+          -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+          -Name "UserAuthentication" `
+          -Value 1
+
+        Enable-NetFirewallRule `
+          -DisplayGroup "Remote Desktop" `
+          -ErrorAction SilentlyContinue
+
+        Write-Host "Remote Desktop prepared." -ForegroundColor Green
+
+    # ============================================================
+    # INFORMAÇÕES DO SISTEMA
+    # ============================================================
+    - name: System Information
+      shell: powershell
+      run: |
+        Write-Host "========================================" -ForegroundColor Cyan
+        Write-Host "SYSTEM INFORMATION" -ForegroundColor Green
+        Write-Host "========================================" -ForegroundColor Cyan
+
+        Write-Host "Instance Number: ${{ github.event.inputs.instance_number }}" -ForegroundColor Yellow
+        Write-Host "Runner: $env:RUNNER_NAME" -ForegroundColor Yellow
+        Write-Host "Workflow: $env:GITHUB_WORKFLOW" -ForegroundColor Yellow
+
+        Get-ComputerInfo |
+          Select-Object WindowsProductName, WindowsVersion, OsBuildNumber
+
+        Get-CimInstance Win32_Processor |
+          Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+
+    # ============================================================
+    # PREPARAR WINGET
+    # ============================================================
+    - name: Prepare WinGet
+      shell: powershell
+      run: |
+        Write-Host "Checking WinGet..." -ForegroundColor Green
+
+        $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+
+        if ($null -ne $winget) {
+          Write-Host "WinGet found." -ForegroundColor Green
+          winget --version
+        }
+        else {
+          Write-Host "WinGet is not available on this runner." -ForegroundColor Yellow
+        }
+
+    # ============================================================
+    # RESTAURAR ESTADO ANTERIOR
+    # ============================================================
+    - name: Restore Saved PC State
+      shell: powershell
+      run: |
+        Write-Host "========================================" -ForegroundColor Cyan
+        Write-Host "RESTORING SAVED PC STATE" -ForegroundColor Green
+        Write-Host "========================================" -ForegroundColor Cyan
+
+        $statePath = ".pc-state\state.json"
+
+        if (-not (Test-Path -LiteralPath $statePath)) {
+          Write-Host "No previous state found." -ForegroundColor Yellow
+          Write-Host "This is the first runner." -ForegroundColor Yellow
+          exit 0
+        }
+
+        try {
+          $state = Get-Content `
+            -LiteralPath $statePath `
+            -Raw |
+            ConvertFrom-Json
+
+          Write-Host "Saved state loaded." -ForegroundColor Green
+        }
+        catch {
+          Write-Host "Could not read saved state." -ForegroundColor Yellow
+          Write-Host $_.Exception.Message -ForegroundColor Yellow
+          exit 0
+        }
+
+        # --------------------------------------------------------
+        # RESTAURAR RDP
+        # --------------------------------------------------------
+
+        if ($null -ne $state.Settings) {
+
+          if ($state.Settings.RDPEnabled -eq $true) {
+
+            Write-Host "Restoring RDP..." -ForegroundColor Cyan
+
+            Set-ItemProperty `
+              -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+              -Name "fDenyTSConnections" `
+              -Value 0
+
+            Set-ItemProperty `
+              -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+              -Name "UserAuthentication" `
+              -Value 1
+
+            Enable-NetFirewallRule `
+              -DisplayGroup "Remote Desktop" `
+              -ErrorAction SilentlyContinue
+          }
+        }
+
+        # --------------------------------------------------------
+        # RESTAURAR SERVIÇOS
+        # --------------------------------------------------------
+
+        if ($null -ne $state.Services) {
+
+          foreach ($savedService in $state.Services) {
+
+            try {
+
+              $service = Get-Service `
+                -Name $savedService.Name `
+                -ErrorAction SilentlyContinue
+
+              if ($null -ne $service) {
+
+                if ($savedService.StartType -eq "Automatic") {
+                  Set-Service `
+                    -Name $savedService.Name `
+                    -StartupType Automatic `
+                    -ErrorAction SilentlyContinue
+                }
+                elseif ($savedService.StartType -eq "Manual") {
+                  Set-Service `
+                    -Name $savedService.Name `
+                    -StartupType Manual `
+                    -ErrorAction SilentlyContinue
+                }
+                elseif ($savedService.StartType -eq "Disabled") {
+                  Set-Service `
+                    -Name $savedService.Name `
+                    -StartupType Disabled `
+                    -ErrorAction SilentlyContinue
+                }
+
+                if ($savedService.Status -eq "Running") {
+                  Start-Service `
+                    -Name $savedService.Name `
+                    -ErrorAction SilentlyContinue
+                }
+
+                Write-Host `
+                  "Restored service: $($savedService.Name)" `
+                  -ForegroundColor Green
+              }
+            }
+            catch {
+              Write-Host `
+                "Could not restore service: $($savedService.Name)" `
+                -ForegroundColor Yellow
+            }
+          }
+        }
+
+        # --------------------------------------------------------
+        # RESTAURAR APLICATIVOS
+        # --------------------------------------------------------
+
+        if ($null -eq $state.Applications) {
+          Write-Host "No saved applications found." -ForegroundColor Yellow
+          exit 0
+        }
+
+        $wingetCommand = Get-Command winget.exe -ErrorAction SilentlyContinue
+
+        if ($null -eq $wingetCommand) {
+          Write-Host "WinGet is unavailable." -ForegroundColor Yellow
+          Write-Host "Applications will not be restored automatically." -ForegroundColor Yellow
+          exit 0
+        }
+
+        Write-Host "========================================" -ForegroundColor Cyan
+        Write-Host "APPLICATION RESTORATION" -ForegroundColor Green
+        Write-Host "========================================" -ForegroundColor Cyan
+
+        foreach ($app in $state.Applications) {
+
+          $appName = [string]$app.Name
+          $wingetId = [string]$app.WingetId
+
+          if ([string]::IsNullOrWhiteSpace($wingetId)) {
+            Write-Host "No WinGet ID for: $appName" -ForegroundColor Yellow
+            continue
+          }
+
+          Write-Host "Checking: $appName" -ForegroundColor White
+
+          $installed = $false
+
+          try {
+
+            winget list `
+              --id "$wingetId" `
+              --exact `
+              --accept-source-agreements `
+              --disable-interactivity 2>$null
+
+            if ($LASTEXITCODE -eq 0) {
+              $installed = $true
+            }
+          }
+          catch {
+            $installed = $false
+          }
+
+          if ($installed) {
+            Write-Host "$appName is already installed." -ForegroundColor Green
+            continue
+          }
+
+          Write-Host "$appName is missing. Installing..." -ForegroundColor Yellow
+
+          try {
+
+            winget install `
+              --id "$wingetId" `
+              --exact `
+              --silent `
+              --accept-package-agreements `
+              --accept-source-agreements `
+              --disable-interactivity
+
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "$appName restored successfully." -ForegroundColor Green
+            }
+            else {
+              Write-Host "Could not install $appName." -ForegroundColor Yellow
+            }
+          }
+          catch {
+            Write-Host "Installation failed for $appName." -ForegroundColor Yellow
+          }
+        }
+
+        Write-Host "Application restoration finished." -ForegroundColor Green
+
+    # ============================================================
+    # WINDOWS UPDATE
+    # ============================================================
+    - name: Update Windows Server 2022
+      shell: powershell
+      run: |
+        Write-Host "Checking for Windows updates..." -ForegroundColor Green
+
+        [Net.ServicePointManager]::SecurityProtocol =
+          [Net.SecurityProtocolType]::Tls12
+
+        try {
+          Install-PackageProvider `
+            -Name NuGet `
+            -MinimumVersion 2.8.5.201 `
+            -Force `
+            -ErrorAction Stop
+
+          Write-Host "NuGet provider installed successfully." -ForegroundColor Green
+        }
+        catch {
+          Write-Host "NuGet provider unavailable or already installed." -ForegroundColor Yellow
+        }
+
+        try {
+          Set-PSRepository `
+            -Name PSGallery `
+            -InstallationPolicy Trusted
+        }
+        catch {
+        }
+
+        if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+
+          try {
+            Install-Module `
+              -Name PSWindowsUpdate `
+              -Force `
+              -AllowClobber `
+              -Scope CurrentUser `
+              -ErrorAction Stop
+
+            Write-Host "PSWindowsUpdate installed." -ForegroundColor Green
+          }
+          catch {
+            Write-Host "Could not install PSWindowsUpdate." -ForegroundColor Yellow
+          }
+        }
+
+        if (Get-Module -ListAvailable -Name PSWindowsUpdate) {
+
+          Import-Module PSWindowsUpdate -Force
+
+          try {
+
+            Get-WindowsUpdate `
+              -MicrosoftUpdate `
+              -AcceptAll `
+              -Install `
+              -IgnoreReboot `
+              -Verbose
+
+            Write-Host "Windows update process completed." -ForegroundColor Green
+          }
+          catch {
+
+            Write-Host `
+              "Windows Update could not complete." `
+              -ForegroundColor Yellow
+          }
+        }
+
+    # ============================================================
+    # ENABLE RDP
+    # ============================================================
+    - name: Enable RDP
+      shell: powershell
+      run: |
+        Write-Host "Enabling Remote Desktop..." -ForegroundColor Green
+
+        Set-ItemProperty `
+          -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+          -Name "fDenyTSConnections" `
+          -Value 0
+
+        Set-ItemProperty `
+          -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+          -Name "UserAuthentication" `
+          -Value 1
+
+        Enable-NetFirewallRule `
+          -DisplayGroup "Remote Desktop" `
+          -ErrorAction SilentlyContinue
+
+        Write-Host "RDP enabled." -ForegroundColor Green
+
+    # ============================================================
+    # USUÁRIO RAFAEL
+    # ============================================================
+    - name: Create User Account
+      shell: powershell
+      run: |
+        Write-Host "Setting up user account..." -ForegroundColor Green
+
+        $Password = ConvertTo-SecureString `
+          "P@ssw0rd!" `
+          -AsPlainText `
+          -Force
+
+        $existingUser = Get-LocalUser `
+          -Name "Rafael" `
+          -ErrorAction SilentlyContinue
+
+        if ($null -ne $existingUser) {
+
+          Set-LocalUser `
+            -Name "Rafael" `
+            -Password $Password
+
+          Write-Host "Rafael already existed." -ForegroundColor Green
+        }
+        else {
+
+          New-LocalUser `
+            -Name "Rafael" `
+            -Password $Password `
+            -FullName "Rafael"
+
+          Write-Host "Rafael created." -ForegroundColor Green
+        }
+
+        Add-LocalGroupMember `
+          -Group "Administrators" `
+          -Member "Rafael" `
+          -ErrorAction SilentlyContinue
+
+        Add-LocalGroupMember `
+          -Group "Remote Desktop Users" `
+          -Member "Rafael" `
+          -ErrorAction SilentlyContinue
+
+        Write-Host "Username: Rafael" -ForegroundColor Yellow
+        Write-Host "Rafael is an Administrator." -ForegroundColor Green
+
+    # ============================================================
+    # AUDIO
+    # ============================================================
+    - name: Fix Windows Audio
+      shell: powershell
+      run: |
+        Write-Host "Configuring Windows Audio..." -ForegroundColor Green
+
+        foreach ($service in @(
+          "Audiosrv",
+          "AudioEndpointBuilder"
+        )) {
+
+          try {
+
+            Set-Service `
+              -Name $service `
+              -StartupType Automatic `
+              -ErrorAction Stop
+
+            Start-Service `
+              -Name $service `
+              -ErrorAction SilentlyContinue
+
+            Write-Host `
+              "$service configured." `
+              -ForegroundColor Green
+          }
+          catch {
+
+            Write-Host `
+              "Could not configure $service." `
+              -ForegroundColor Yellow
+          }
+        }
+
+    # ============================================================
+    # NETWORK
+    # ============================================================
+    - name: Configure Network
+      shell: powershell
+      run: |
+        Write-Host "Configuring network..." -ForegroundColor Green
+
+        $networkServices = @(
+          "Dhcp",
+          "Dnscache",
+          "NlaSvc",
+          "netprofm"
+        )
+
+        foreach ($service in $networkServices) {
+
+          try {
+
+            Set-Service `
+              -Name $service `
+              -StartupType Automatic `
+              -ErrorAction SilentlyContinue
+
+            Start-Service `
+              -Name $service `
+              -ErrorAction SilentlyContinue
+          }
+          catch {
+          }
+        }
+
+        Get-NetAdapter |
+          Select-Object Name, InterfaceDescription, Status, LinkSpeed
+
+    # ============================================================
+    # TAILSCALE
+    # ============================================================
+    - name: Install Tailscale (Silent)
+      shell: powershell
+      run: |
+        Write-Host "Downloading Tailscale..." -ForegroundColor Green
+
+        $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+        $installerPath = "$env:TEMP\tailscale.msi"
+
+        Invoke-WebRequest `
+          -Uri $tsUrl `
+          -OutFile $installerPath
+
+        Start-Process `
+          msiexec.exe `
+          -ArgumentList "/i `"$installerPath`" /quiet /norestart" `
+          -Wait
+
+        Remove-Item `
+          $installerPath `
+          -Force `
+          -ErrorAction SilentlyContinue
+
+        Write-Host "Tailscale installed." -ForegroundColor Green
+
+    # ============================================================
+    # START TAILSCALE
+    # ============================================================
+    - name: Start Tailscale
+      shell: powershell
+      run: |
+        Write-Host "Starting Tailscale..." -ForegroundColor Green
+
+        $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+        $hostname = "enigmano-${{ github.run_id }}"
+        $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+
+        if (-not (Test-Path -LiteralPath $tailscale)) {
+          Write-Host "Tailscale executable not found." -ForegroundColor Red
+          exit 1
+        }
+
+        if ([string]::IsNullOrWhiteSpace($authKey)) {
+          Write-Host "TAILSCALE_AUTH_KEY is missing." -ForegroundColor Red
+          exit 1
+        }
+
+        & $tailscale up `
+          "--authkey=$authKey" `
+          "--hostname=$hostname"
+
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "Tailscale failed." -ForegroundColor Red
+          exit 1
+        }
+
+        Start-Sleep -Seconds 15
+
+        Write-Host "Tailscale started successfully." -ForegroundColor Green
+
+    # ============================================================
+    # TAILSCALE IP
+    # ============================================================
+    - name: Get Tailscale IP
+      shell: powershell
+      run: |
+        $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+        $tsIP = & $tailscale ip -4
+
+        if ([string]::IsNullOrWhiteSpace($tsIP)) {
+          Write-Host "Could not obtain Tailscale IP." -ForegroundColor Red
+          exit 1
+        }
+
+        Write-Host "Tailscale IP: $tsIP" -ForegroundColor Green
+
+        "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+    # ============================================================
+    # CHROME
+    # ============================================================
+    - name: Install Google Chrome (Direct)
+      shell: powershell
+      run: |
+        Write-Host "Installing Google Chrome..." -ForegroundColor Green
+
+        $chromeUrl = "https://dl.google.com/chrome/install/latest/chrome_installer.exe"
+        $installerPath = "$env:TEMP\chrome_installer.exe"
+
+        Invoke-WebRequest `
+          -Uri $chromeUrl `
+          -OutFile $installerPath
+
+        Start-Process `
+          -FilePath $installerPath `
+          -ArgumentList "/silent /install" `
+          -Wait
+
+        Remove-Item `
+          $installerPath `
+          -Force `
+          -ErrorAction SilentlyContinue
+
+        Write-Host "Google Chrome installed." -ForegroundColor Green
+
+    # ============================================================
+    # 7-ZIP
+    # ============================================================
+    - name: Install 7-Zip (Direct)
+      shell: powershell
+      run: |
+        Write-Host "Installing 7-Zip..." -ForegroundColor Green
+
+        $zipUrl = "https://www.7-zip.org/a/7z2409-x64.exe"
+        $installerPath = "$env:TEMP\7z-installer.exe"
+
+        Invoke-WebRequest `
+          -Uri $zipUrl `
+          -OutFile $installerPath
+
+        Start-Process `
+          -FilePath $installerPath `
+          -ArgumentList "/S" `
+          -Wait
+
+        Remove-Item `
+          $installerPath 
